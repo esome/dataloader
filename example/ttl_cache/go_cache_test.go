@@ -17,16 +17,16 @@ type Cache[K any, V any] struct {
 }
 
 // Get gets a value from the cache
-func (c *Cache[K, V]) Get(_ context.Context, key dataloader.Key[K]) (dataloader.Thunk[V], bool) {
+func (c *Cache[K, V]) Get(_ context.Context, key dataloader.Key[K]) (*dataloader.Result[V], bool) {
 	v, ok := c.c.Get(key.String())
 	if ok {
-		return v.(dataloader.Thunk[V]), ok
+		return v.(*dataloader.Result[V]), ok
 	}
 	return nil, ok
 }
 
 // Set sets a value in the cache
-func (c *Cache[K, V]) Set(_ context.Context, key dataloader.Key[K], value dataloader.Thunk[V]) {
+func (c *Cache[K, V]) Set(_ context.Context, key dataloader.Key[K], value *dataloader.Result[V]) {
 	c.c.Set(key.String(), value, 0)
 }
 

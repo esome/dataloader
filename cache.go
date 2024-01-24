@@ -4,8 +4,8 @@ import "context"
 
 // The Cache interface. If a custom cache is provided, it must implement this interface.
 type Cache[K any, V any] interface {
-	Get(context.Context, Key[K]) (Thunk[V], bool)
-	Set(context.Context, Key[K], Thunk[V])
+	Get(context.Context, Key[K]) (*Result[V], bool)
+	Set(context.Context, Key[K], *Result[V])
 	Delete(context.Context, Key[K]) bool
 	Clear()
 }
@@ -18,10 +18,10 @@ var _ Cache[any, any] = (*NoCache[any, any])(nil)
 type NoCache[K any, V any] struct{}
 
 // Get is a NOOP
-func (c *NoCache[K, V]) Get(context.Context, Key[K]) (Thunk[V], bool) { return nil, false }
+func (c *NoCache[K, V]) Get(context.Context, Key[K]) (*Result[V], bool) { return nil, false }
 
 // Set is a NOOP
-func (c *NoCache[K, V]) Set(context.Context, Key[K], Thunk[V]) { return }
+func (c *NoCache[K, V]) Set(context.Context, Key[K], *Result[V]) { return }
 
 // Delete is a NOOP
 func (c *NoCache[K, V]) Delete(context.Context, Key[K]) bool { return false }

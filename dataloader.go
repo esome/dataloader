@@ -70,11 +70,8 @@ type Loader[K any, V any] struct {
 
 	// the internal cache. This packages contains a basic cache implementation but any custom cache
 	// implementation could be used as long as it implements the `Cache` interface.
-	cacheLock sync.Mutex
-	cache     Cache[K, V]
-	// should we clear the cache on each batch?
-	// this would allow batching but no long term caching
-	clearCacheOnBatch bool
+
+	cache *cache[K, V]
 
 	// count of queued up items
 	count int
@@ -122,7 +119,7 @@ type Option[K any, V any] func(*Loader[K, V])
 // WithCache sets the BatchedLoader cache. Defaults to InMemoryCache if a Cache is not set.
 func WithCache[K any, V any](c Cache[K, V]) Option[K, V] {
 	return func(l *Loader[K, V]) {
-		l.cache = c
+		l.cache.results = c
 	}
 }
 
@@ -152,9 +149,9 @@ func WithWait[K any, V any](d time.Duration) Option[K, V] {
 // It accomplishes this by clearing the cache after each batch operation.
 func WithClearCacheOnBatch[K any, V any]() Option[K, V] {
 	return func(l *Loader[K, V]) {
-		l.cacheLock.Lock()
-		l.clearCacheOnBatch = true
-		l.cacheLock.Unlock()
+		l.cache.Lock()
+		l.cache.clearOnBatch = true
+		l.cache.Unlock()
 	}
 }
 
@@ -178,6 +175,9 @@ func NewBatchedLoader[K any, V any](batchFn BatchFunc[K, V], opts ...Option[K, V
 		batchFn:  batchFn,
 		inputCap: 1000,
 		wait:     16 * time.Millisecond,
+		cache: &cache[K, V]{
+			thunks: make(map[string]Thunk[V]),
+		},
 	}
 
 	// Apply options
@@ -186,8 +186,8 @@ func NewBatchedLoader[K any, V any](batchFn BatchFunc[K, V], opts ...Option[K, V
 	}
 
 	// Set defaults
-	if loader.cache == nil {
-		loader.cache = NewCache[K, V]()
+	if loader.cache.results == nil {
+		loader.cache.results = NewCache[K, V]()
 	}
 
 	if loader.tracer == nil {
@@ -210,10 +210,10 @@ func (l *Loader[K, V]) Load(originalContext context.Context, key Key[K]) Thunk[V
 	}
 
 	// lock to prevent duplicate keys coming in before item has been added to cache.
-	l.cacheLock.Lock()
-	if v, ok := l.cache.Get(ctx, key); ok {
+	l.cache.Lock()
+	if v, ok := l.cache.get(ctx, key); ok {
 		defer finish(v)
-		defer l.cacheLock.Unlock()
+		defer l.cache.Unlock()
 		return v
 	}
 
@@ -226,21 +226,19 @@ func (l *Loader[K, V]) Load(originalContext context.Context, key Key[K]) Thunk[V
 			result.mu.Lock()
 			if v, ok := <-c; ok {
 				result.value = v
+				l.cache.registerResult(ctx, key, v)
 			}
 			result.mu.Unlock()
 		}
 		result.mu.RLock()
 		defer result.mu.RUnlock()
-		var ev *PanicErrorWrapper
-		if result.value.Error != nil && errors.As(result.value.Error, &ev) {
-			l.Clear(ctx, key)
-		}
+
 		return result.value.Data, result.value.Error
 	}
 	defer finish(thunk)
 
-	l.cache.Set(ctx, key, thunk)
-	l.cacheLock.Unlock()
+	l.cache.registerThunk(ctx, key, thunk)
+	l.cache.Unlock()
 
 	// this is sent to batch fn. It contains the key and the channel to return the result on
 	req := &batchRequest[K, V]{key, c}
@@ -348,29 +346,22 @@ func (l *Loader[K, V]) LoadMany(originalContext context.Context, keys Keys[K]) T
 
 // Clear clears the value at `key` from the cache, if it exists. Returns self for method chaining
 func (l *Loader[K, V]) Clear(ctx context.Context, key Key[K]) Interface[K, V] {
-	l.cacheLock.Lock()
-	l.cache.Delete(ctx, key)
-	l.cacheLock.Unlock()
+	l.cache.clear(ctx, key)
 	return l
 }
 
 // ClearAll clears the entire cache. To be used when some event results in unknown invalidations.
 // Returns self for method chaining.
 func (l *Loader[K, V]) ClearAll() Interface[K, V] {
-	l.cacheLock.Lock()
-	l.cache.Clear()
-	l.cacheLock.Unlock()
+	l.cache.clearAll()
 	return l
 }
 
 // Prime adds the provided key and value to the cache. If the key already exists, no change is made.
 // Returns self for method chaining
 func (l *Loader[K, V]) Prime(ctx context.Context, key Key[K], value V) Interface[K, V] {
-	if _, ok := l.cache.Get(ctx, key); !ok {
-		thunk := func() (V, error) {
-			return value, nil
-		}
-		l.cache.Set(ctx, key, thunk)
+	if _, ok := l.cache.get(ctx, key); !ok {
+		l.cache.results.Set(ctx, key, &Result[V]{Data: value})
 	}
 	return l
 }
@@ -379,8 +370,8 @@ func (l *Loader[K, V]) reset() {
 	l.count = 0
 	l.curBatcher = nil
 
-	if l.clearCacheOnBatch {
-		l.cache.Clear()
+	if l.cache.clearOnBatch {
+		l.cache.clearAll()
 	}
 }
 
@@ -446,7 +437,7 @@ func (b *batcher[K, V]) batch(originalContext context.Context) {
 
 	if panicErr != nil {
 		for _, req := range reqs {
-			req.channel <- &Result[V]{Error: &PanicErrorWrapper{panicError: fmt.Errorf("Panic received in batch function: %v", panicErr)}}
+			req.channel <- &Result[V]{Error: &PanicErrorWrapper{panicError: fmt.Errorf("panic received in batch function: %v", panicErr)}}
 			close(req.channel)
 		}
 		return
@@ -501,4 +492,72 @@ func (l *Loader[K, V]) sleeper(b *batcher[K, V], close chan bool) {
 		l.reset()
 	}
 	l.batchLock.Unlock()
+}
+
+type cache[K, V any] struct {
+	sync.Mutex
+	// should we clear the cache on each batch?
+	// this would allow batching but no long term caching
+	clearOnBatch bool
+	thunks       map[string]Thunk[V]
+	results      Cache[K, V]
+}
+
+func (c *cache[K, V]) get(ctx context.Context, key Key[K]) (Thunk[V], bool) {
+	if v, ok := c.thunks[key.String()]; ok {
+		return v, ok
+	}
+
+	if v, ok := c.results.Get(ctx, key); ok {
+		return func() (V, error) {
+			return v.Data, v.Error
+		}, ok
+	}
+
+	return nil, false
+}
+
+// registerThunk registers a thunk for the given key.
+//
+// It requires manual locking!
+func (c *cache[K, V]) registerThunk(ctx context.Context, key Key[K], thunk Thunk[V]) {
+	c.thunks[key.String()] = thunk
+	c.results.Delete(ctx, key)
+}
+
+// registerResult registers the value for the given key in teh actual Cache implementation, removing it from the thunks
+//
+// Since it's called from the original Thunk itself, it takes care for the locking on its own!
+func (c *cache[K, V]) registerResult(ctx context.Context, key Key[K], value *Result[V]) {
+	c.Lock()
+	defer c.Unlock()
+	delete(c.thunks, key.String())
+
+	if c.clearOnBatch {
+		return
+	}
+
+	var ev *PanicErrorWrapper
+	if value.Error != nil && errors.As(value.Error, &ev) {
+		return
+	}
+
+	c.results.Set(ctx, key, value)
+}
+
+// Clear clears the value at `key` from the cache, if it exists. Returns self for method chaining
+func (c *cache[K, V]) clear(ctx context.Context, key Key[K]) {
+	c.Lock()
+	delete(c.thunks, key.String())
+	c.results.Delete(ctx, key)
+	c.Unlock()
+}
+
+// ClearAll clears the entire cache. To be used when some event results in unknown invalidations.
+// Returns self for method chaining.
+func (c *cache[K, V]) clearAll() {
+	c.Lock()
+	c.thunks = make(map[string]Thunk[V])
+	c.results.Clear()
+	c.Unlock()
 }
